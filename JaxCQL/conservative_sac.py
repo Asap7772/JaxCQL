@@ -12,6 +12,7 @@ import flax.linen as nn
 from flax.training.train_state import TrainState
 import optax
 import distrax
+import copy
 
 from .jax_utils import next_rng, value_and_multi_grad, mse_loss
 from .model import Scalar, update_target_network
@@ -50,6 +51,7 @@ class ConservativeSAC(object):
     def __init__(self, config, policy, qf):
         self.config = self.get_default_config(config)
         self.policy = policy
+        self.behavior_policy = copy.deepcopy(policy)
         self.qf = qf
         self.observation_dim = policy.observation_dim
         self.action_dim = policy.action_dim
@@ -64,6 +66,13 @@ class ConservativeSAC(object):
         policy_params = self.policy.init(next_rng(), next_rng(), jnp.zeros((10, self.observation_dim)))
         self._train_states['policy'] = TrainState.create(
             params=policy_params,
+            tx=optimizer_class(self.config.policy_lr),
+            apply_fn=None
+        )
+        
+        behavior_policy_params = self.behavior_policy.init(next_rng(), next_rng(), jnp.zeros((10, self.observation_dim)))
+        self._train_states['behavior_policy'] = TrainState.create(
+            params=behavior_policy_params,
             tx=optimizer_class(self.config.policy_lr),
             apply_fn=None
         )
@@ -82,7 +91,7 @@ class ConservativeSAC(object):
         )
         self._target_qf_params = deepcopy({'qf1': qf1_params, 'qf2': qf2_params})
 
-        model_keys = ['policy', 'qf1', 'qf2']
+        model_keys = ['policy','behavior_policy', 'qf1', 'qf2']
 
         if self.config.use_automatic_entropy_tuning:
             self.log_alpha = Scalar(0.0)
@@ -92,6 +101,14 @@ class ConservativeSAC(object):
                 apply_fn=None
             )
             model_keys.append('log_alpha')
+            
+            self.log_alpha_behavior = Scalar(0.0)
+            self._train_states['log_alpha_behavior'] = TrainState.create(
+                params=self.log_alpha_behavior.init(next_rng()),
+                tx=optimizer_class(self.config.policy_lr),
+                apply_fn=None
+            )
+            model_keys.append('log_alpha_behavior')
 
         if self.config.cql_lagrange:
             self.log_alpha_prime = Scalar(1.0)
@@ -136,8 +153,8 @@ class ConservativeSAC(object):
                 alpha = self.config.alpha_multiplier
 
             """ Policy loss """
+            log_probs = self.policy.apply(train_params['policy'], observations, actions, method=self.policy.log_prob)
             if bc:
-                log_probs = self.policy.apply(train_params['policy'], observations, actions, method=self.policy.log_prob)
                 policy_loss = (alpha*log_pi - log_probs).mean()
             else:
                 q_new_actions = jnp.minimum(
@@ -147,6 +164,24 @@ class ConservativeSAC(object):
                 policy_loss = (alpha*log_pi - q_new_actions).mean()
 
             loss_collection['policy'] = policy_loss
+            
+            """ Behavior policy loss """
+            
+            new_actions_behavior, log_pi_behavior = self.policy.apply(train_params['policy'], split_rng, observations)
+            if self.config.use_automatic_entropy_tuning:
+                alpha_behavior_loss = -self.log_alpha.apply(train_params['log_alpha_behavior']) * (log_pi_behavior + self.config.target_entropy).mean()
+                loss_collection['log_alpha_behavior'] = alpha_behavior_loss
+                alpha_behavior = jnp.exp(self.log_alpha.apply(train_params['log_alpha_behavior'])) * self.config.alpha_multiplier
+            else:
+                alpha_behavior_loss = 0.0
+                alpha_behavior = self.config.alpha_multiplier
+            
+            log_probs_behavior = self.behavior_policy.apply(train_params['behavior_policy'], \
+                observations, actions, method=self.policy.log_prob)
+            behavior_policy_loss = (alpha_behavior*log_pi_behavior - log_probs_behavior).mean()
+            loss_collection['behavior_policy'] = behavior_policy_loss
+            log_probs_behavior_pi = self.behavior_policy.apply(train_params['behavior_policy'], \
+                observations, new_actions, method=self.policy.log_prob)          
 
             """ Q function loss """
             q1_pred = self.qf.apply(train_params['qf1'], observations, actions)
@@ -275,6 +310,7 @@ class ConservativeSAC(object):
 
             loss_collection['qf1'] = qf1_loss
             loss_collection['qf2'] = qf2_loss
+            
             return tuple(loss_collection[key] for key in self.model_keys), locals()
 
         train_params = {key: train_states[key].params for key in self.model_keys}
@@ -293,6 +329,15 @@ class ConservativeSAC(object):
             new_train_states['qf2'].params, target_qf_params['qf2'],
             self.config.soft_target_update_rate
         )
+        
+        ### DIVERGENCE TERM ###
+
+        # Compute Forward KL Divergence between pi and pi beta
+        
+        # for pi use actions sampled
+        kl_forward = jnp.mean(aux_values['log_pis'] - aux_values['log_probs_behavior_pi'])
+        # for pi beat use dataset actions
+        kl_reverse = jnp.mean(aux_values['log_probs_behavior'] - aux_values['log_probs'])
 
         metrics = dict(
             log_pi=aux_values['log_pi'].mean(),
